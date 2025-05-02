@@ -1,0 +1,596 @@
+#+title: Kubernetes the hard way (on cheap Raspberry Pi cluster)
+
+* Notes
+Based on: [[https://github.com/kelseyhightower/kubernetes-the-hard-way][Kubernetes The Hard Way by kelseyhightower]]
+Changes
+- Remove kube-proxy, use Cillium instead
+
+Other references
+- [[https://unix.stackexchange.com/questions/471476/how-do-i-check-cgroup-v2-is-installed-on-my-machine][Check ~cgroup~ version]]
+
+* Initial hardware setup
+- 01 x server node: Orange Pi Zero 3
+  - server: 4 CPU 2 GiB memory
+- 02 x worker node: Raspberry Pi 4B
+  - node-0: 4 CPU 8GiB memory
+  - node-1: 4 CPU 4GiB memory
+
+* Outline
+- Download binaries to
+  - downloads
+    - arm64
+    - amd64
+- Use symlink to setup for each node
+* Download and extract binaries
+Download
+#+begin_src sh
+  for ARCH in arm64 amd64;
+  do
+      mkdir -p downloads/${ARCH}
+      wget -q --show-progress \
+           --https-only \
+           --timestamping \
+           -P downloads/${ARCH} \
+           -i downloads.${ARCH}.txt
+  done
+#+end_src
+Extract, put into places and make executable
+#+begin_src sh
+  for ARCH in amd64 arm64;
+  do
+      mkdir -p downloads/${ARCH}/{client,cni-plugins,controller,worker}
+      tar -xvf downloads/${ARCH}/crictl-v1.33.0-linux-${ARCH}.tar.gz \
+          -C downloads/${ARCH}/worker/
+      tar -xvf downloads/${ARCH}/containerd-2.1.0-rc.0-linux-${ARCH}.tar.gz \
+          --strip-components 1 \
+          -C downloads/${ARCH}/worker/
+      tar -xvf downloads/${ARCH}/cni-plugins-linux-${ARCH}-v1.7.1.tgz \
+          -C downloads/${ARCH}/cni-plugins/
+      tar -xvf downloads/${ARCH}/etcd-v3.6.0-rc.4-linux-${ARCH}.tar.gz \
+          -C downloads/${ARCH}/ \
+          --strip-components 1 \
+          etcd-v3.6.0-rc.4-linux-${ARCH}/etcdctl \
+          etcd-v3.6.0-rc.4-linux-${ARCH}/etcd
+      mv downloads/${ARCH}/{etcdctl,kubectl} downloads/${ARCH}/client/
+      mv downloads/${ARCH}/{etcd,kube-apiserver,kube-controller-manager,kube-scheduler} \
+         downloads/${ARCH}/controller/
+      mv downloads/${ARCH}/kubelet downloads/${ARCH}/worker/
+      mv downloads/${ARCH}/runc.${ARCH} downloads/${ARCH}/worker/runc
+      chmod +x downloads/${ARCH}/worker/{kubelet,runc}
+      chmod +x downloads/${ARCH}/client/kubectl
+      chmod +x downloads/${ARCH}/controller/kube-{apiserver,controller-manager,scheduler}
+  done
+#+end_src
+
+* Organize to-be-used computer resources
+Setup SSH, hostname
+#+begin_src sh
+  cp machines.txt{.template,}
+  # example
+  # 192.168.68.106 server.kubernetes.local server
+  # 192.168.68.111 node-0.kubernetes.local node-0 10.200.0.0/24
+  # 192.168.68.112 node-1.kubernetes.local node-1 10.200.1.0/24
+
+  ln -s $(pwd)/secrets/sshkey /home/ndd/.ssh/homelab
+
+  while read IP FQDN HOST SUBNET; do
+      CMD="sed -i 's/^127.0.1.1.*/127.0.1.1\t${FQDN} ${HOST}/' /etc/hosts"
+      ssh -i secrets/sshkey -n root@${IP} "$CMD"
+      ssh -i secrets/sshkey -n root@${IP} hostnamectl set-hostname ${HOST}
+      ssh -i secrets/sshkey -n root@${IP} systemctl restart systemd-hostnamed
+  done < machines.txt
+
+  # verify
+  while read IP FQDN HOST SUBNET; do
+      ssh -i secrets/sshkey -n root@${IP} hostname --fqdn
+  done < machines.txt
+  # output
+  server.kubernetes.local
+  node-0.kubernetes.local
+  node-1.kubernetes.local
+
+#+end_src
+Setup ~/etc/hosts~ file
+#+begin_src sh
+  echo "# Homelab" > hosts
+  while read IP FQDN HOST SUBNET; do
+      ENTRY="${IP} ${FQDN} ${HOST}"
+      echo $ENTRY >> hosts
+  done < machines.txt
+  # optional
+  cat hosts >> /etc/hosts
+#+end_src
+Verify
+#+begin_src sh
+  for host in server node-0 node-1
+  do ssh -i secrets/sshkey root@${host} hostname
+  done
+#+end_src
+Add host file to remote machines
+#+begin_src sh
+  while read IP FQDN HOST SUBNET; do
+      scp -i secrets/sshkey hosts root@${HOST}:~/
+      ssh -i secrets/sshkey -n \
+          root@${HOST} "cat hosts >> /etc/hosts && rm hosts"
+  done < machines.txt
+#+end_src
+
+* Setup Certificate Authority (CA) certificates
+
+Check ~ca.conf~ file and adjust for your setup (remove kube-proxy section)
+#+begin_src sh
+  mkdir -p secrets/certs
+  ln -s $(pwd)/ca.conf $(pwd)/secrets/certs/ca.conf
+  openssl genrsa -out secrets/certs/ca.key 4096
+  openssl req -x509 -new -sha512 -noenc \
+          -key secrets/certs/ca.key -days 3653 \
+          -config secrets/certs/ca.conf \
+          -out secrets/certs/ca.crt
+  # output
+  ls -lah secrets/certs
+  total 20K
+  drwxr-xr-x. 2 ndd ndd 4.0K May  2 18:45 .
+  drwxr-xr-x. 3 ndd ndd 4.0K May  2 18:45 ..
+  lrwxrwxrwx. 1 ndd ndd   67 May  2 18:45 ca.conf -> /home/ndd/station/k8s-homelab/kubernetes-on-pi-the-hard-way/ca.conf
+  -rw-r--r--. 1 ndd ndd 1.9K May  2 18:45 ca.crt
+  -rw-------. 1 ndd ndd 3.2K May  2 18:45 ca.key
+#+end_src
+Create components certificates and private keys
+#+begin_src sh
+  certs=(
+      "admin" "node-0" "node-1"
+      "kube-scheduler"
+      "kube-controller-manager"
+      "kube-api-server"
+      "service-accounts"
+  )
+  CERTDIR=secrets/certs
+  for i in ${certs[*]}; do
+      openssl genrsa -out "${CERTDIR}/${i}.key" 4096
+
+      openssl req -new -key "${CERTDIR}/${i}.key" -sha256 \
+              -config "${CERTDIR}/ca.conf" -section ${i} \
+              -out "${CERTDIR}/${i}.csr"
+
+      openssl x509 -req -days 3653 -in "${CERTDIR}/${i}.csr" \
+              -copy_extensions copyall \
+              -sha256 -CA "${CERTDIR}/ca.crt" \
+              -CAkey "${CERTDIR}/ca.key" \
+              -CAcreateserial \
+              -out "${CERTDIR}/${i}.crt"
+  done
+#+end_src
+Check
+#+begin_src sh
+  ls -1 secrets/certs
+  admin.crt
+  admin.csr
+  admin.key
+  ca.conf
+  ca.crt
+  ca.key
+  ca.srl
+  kube-api-server.crt
+  kube-api-server.csr
+  kube-api-server.key
+  kube-controller-manager.crt
+  kube-controller-manager.csr
+  kube-controller-manager.key
+  kube-scheduler.crt
+  kube-scheduler.csr
+  kube-scheduler.key
+  node-0.crt
+  node-0.csr
+  node-0.key
+  node-1.crt
+  node-1.csr
+  node-1.key
+  service-accounts.crt
+  service-accounts.csr
+  service-accounts.key
+
+#+end_src
+** Distribute keys
+Worker nodes
+#+begin_src sh
+  for host in node-0 node-1; do
+      ssh -i secrets/sshkey root@${host} mkdir /var/lib/kubelet/
+
+      scp -i secrets/sshkey secrets/certs/ca.crt root@${host}:/var/lib/kubelet/
+
+      scp -i secrets/sshkey secrets/certs/${host}.crt \
+          root@${host}:/var/lib/kubelet/kubelet.crt
+
+      scp -i secrets/sshkey secrets/certs/${host}.key \
+          root@${host}:/var/lib/kubelet/kubelet.key
+  done
+#+end_src
+Server node
+#+begin_src sh
+  scp -i secrets/sshkey \
+      secrets/certs/ca.key secrets/certs/ca.crt \
+      secrets/certs/kube-api-server.key secrets/certs/kube-api-server.crt \
+      secrets/certs/service-accounts.key secrets/certs/service-accounts.crt \
+      root@server:~/
+#+end_src
+* Generate ~kubeconfig~ file for authentication
+#+begin_src sh
+  AUTHDIR="secrets/kubernetes-auth"
+  mkdir -p ${AUTHDIR}
+#+end_src
+*Note*: kube-proxy is skipped
+** kubelet
+#+begin_src sh
+  CERTDIR="secrets/certs"
+  AUTHDIR="secrets/kubernetes-auth"
+  for host in node-0 node-1; do
+      kubectl config set-cluster homelab \
+              --certificate-authority=${CERTDIR}/ca.crt \
+              --embed-certs=true \
+              --server=https://server.kubernetes.local:6443 \
+              --kubeconfig=${AUTHDIR}/${host}.kubeconfig
+
+      kubectl config set-credentials system:node:${host} \
+              --client-certificate=${CERTDIR}/${host}.crt \
+              --client-key=${CERTDIR}/${host}.key \
+              --embed-certs=true \
+              --kubeconfig=${AUTHDIR}/${host}.kubeconfig
+
+      kubectl config set-context default \
+              --cluster=homelab \
+              --user=system:node:${host} \
+              --kubeconfig=${AUTHDIR}/${host}.kubeconfig
+
+      kubectl config use-context default \
+              --kubeconfig=${AUTHDIR}/${host}.kubeconfig
+  done
+#+end_src
+** kube-controller-manager
+#+begin_src sh
+  CERTDIR="secrets/certs"
+  AUTHDIR="secrets/kubernetes-auth"
+  kubectl config set-cluster homelab \
+            --certificate-authority=${CERTDIR}/ca.crt \
+            --embed-certs=true \
+            --server=https://server.kubernetes.local:6443 \
+            --kubeconfig=${AUTHDIR}/kube-controller-manager.kubeconfig
+
+    kubectl config set-credentials system:kube-controller-manager \
+            --client-certificate=${CERTDIR}/kube-controller-manager.crt \
+            --client-key=${CERTDIR}/kube-controller-manager.key \
+            --embed-certs=true \
+            --kubeconfig=${AUTHDIR}/kube-controller-manager.kubeconfig
+
+    kubectl config set-context default \
+            --cluster=homelab \
+            --user=system:kube-controller-manager \
+            --kubeconfig=${AUTHDIR}/kube-controller-manager.kubeconfig
+
+    kubectl config use-context default \
+            --kubeconfig=${AUTHDIR}/kube-controller-manager.kubeconfig
+#+end_src
+** kube-scheduler
+#+begin_src sh
+  CERTDIR="secrets/certs"
+  AUTHDIR="secrets/kubernetes-auth"
+  kubectl config set-cluster homelab \
+            --certificate-authority=${CERTDIR}/ca.crt \
+            --embed-certs=true \
+            --server=https://server.kubernetes.local:6443 \
+            --kubeconfig=${AUTHDIR}/kube-scheduler.kubeconfig
+
+    kubectl config set-credentials system:kube-scheduler \
+            --client-certificate=${CERTDIR}/kube-scheduler.crt \
+            --client-key=${CERTDIR}/kube-scheduler.key \
+            --embed-certs=true \
+            --kubeconfig=${AUTHDIR}/kube-scheduler.kubeconfig
+
+    kubectl config set-context default \
+            --cluster=homelab \
+            --user=system:kube-scheduler \
+            --kubeconfig=${AUTHDIR}/kube-scheduler.kubeconfig
+
+    kubectl config use-context default \
+            --kubeconfig=${AUTHDIR}/kube-scheduler.kubeconfig
+#+end_src
+** ~admin~ user
+#+begin_src sh
+  CERTDIR="secrets/certs"
+  AUTHDIR="secrets/kubernetes-auth"
+  kubectl config set-cluster homelab \
+            --certificate-authority=${CERTDIR}/ca.crt \
+            --embed-certs=true \
+            --server=https://127.0.0.1:6443 \
+            --kubeconfig=${AUTHDIR}/admin.kubeconfig
+
+    kubectl config set-credentials admin \
+            --client-certificate=${CERTDIR}/admin.crt \
+            --client-key=${CERTDIR}/admin.key \
+            --embed-certs=true \
+            --kubeconfig=${AUTHDIR}/admin.kubeconfig
+
+    kubectl config set-context default \
+            --cluster=homelab \
+            --user=admin \
+            --kubeconfig=${AUTHDIR}/admin.kubeconfig
+
+    kubectl config use-context default \
+            --kubeconfig=${AUTHDIR}/admin.kubeconfig
+#+end_src
+** Distribute authentication config files
+worker nodes
+#+begin_src sh
+  CERTDIR="secrets/certs"
+  AUTHDIR="secrets/kubernetes-auth"
+  for host in node-0 node-1; do
+      ssh -i secrets/sshkey root@${host} "mkdir -p /var/lib/kubelet"
+      scp -i secrets/sshkey ${AUTHDIR}/${host}.kubeconfig \
+          root@${host}:/var/lib/kubelet/kubeconfig
+  done
+#+end_src
+server node
+#+begin_src sh
+  CERTDIR="secrets/certs"
+  AUTHDIR="secrets/kubernetes-auth"
+  scp -i secrets/sshkey ${AUTHDIR}/admin.kubeconfig \
+        ${AUTHDIR}/kube-controller-manager.kubeconfig \
+        ${AUTHDIR}/kube-scheduler.kubeconfig \
+        root@server:~/
+#+end_src
+* Generating the Data Encryption Config and Key
+Generate random key
+#+begin_src sh
+  export ENCRYPTION_KEY=$(head -c 32 /dev/urandom | base64)
+#+end_src
+Replace key
+#+begin_src sh
+  envsubst < configs-templates/encryption-config.yaml > configs/encryption-config.yaml
+#+end_src
+Copy config file
+#+begin_src sh
+  scp -i secrets/sshkey configs/encryption-config.yaml root@server:~/
+#+end_src
+* Bootstrap etcd cluster
+#+begin_src sh
+  export ARCH="arm64"
+  scp -i secrets/sshkey \
+        downloads/${ARCH}/controller/etcd \
+        downloads/${ARCH}/client/etcdctl \
+        units/etcd.service \
+        root@server:~/
+#+end_src
+Jump to server node
+#+begin_src sh
+  ssh -i secrets/sshkey root@server
+#+end_src
+Move binaries
+#+begin_src sh
+  mv etcd etcdctl /usr/local/bin/
+#+end_src
+Configuration
+#+begin_src sh
+  mkdir -p /etc/etcd /var/lib/etcd
+  chmod 700 /var/lib/etcd
+  cp ca.crt kube-api-server.key kube-api-server.crt \
+    /etc/etcd/
+#+end_src
+~systemd~ service unit file
+#+begin_src sh
+  mv etcd.service /etc/systemd/system/
+#+end_src
+Start service
+#+begin_src sh
+  systemctl daemon-reload
+  systemctl enable etcd
+  systemctl start etcd
+#+end_src
+* Bootstrap the Kubernetes Control Plane
+** Prerequisites
+Copy
+#+begin_src sh
+  ARCH="arm64"
+  scp -i secrets/sshkey \
+        downloads/${ARCH}/controller/kube-apiserver \
+        downloads/${ARCH}/controller/kube-controller-manager \
+        downloads/${ARCH}/controller/kube-scheduler \
+        downloads/${ARCH}/client/kubectl \
+        units/kube-apiserver.service \
+        units/kube-controller-manager.service \
+        units/kube-scheduler.service \
+        configs/kube-scheduler.yaml \
+        configs/kube-apiserver-to-kubelet.yaml \
+        root@server:~/
+#+end_src
+Jump to server
+#+begin_src sh
+  ssh -i secrets/sshkey root@server
+#+end_src
+Make config dir
+#+begin_src sh
+  mkdir -p /etc/kubernetes/config
+#+end_src
+** Provision Control Plane
+*** Kube Controller Binaries
+Install binaries
+#+begin_src sh
+  mv kube-apiserver \
+     kube-controller-manager \
+     kube-scheduler kubectl \
+     /usr/local/bin/
+#+end_src
+*** Configure API server
+#+begin_src sh
+  mkdir -p /var/lib/kubernetes/
+
+  mv ca.crt ca.key \
+     kube-api-server.key kube-api-server.crt \
+     service-accounts.key service-accounts.crt \
+     encryption-config.yaml \
+     /var/lib/kubernetes/
+#+end_src
+*** ~kube-apiserver.service~ unit file
+#+begin_src sh
+  mv kube-apiserver.service \
+     /etc/systemd/system/kube-apiserver.service
+#+end_src
+*** Configure Kubernetes Controller Manager
+#+begin_src sh
+  mv kube-controller-manager.kubeconfig /var/lib/kubernetes/
+  mv kube-controller-manager.service /etc/systemd/system/
+#+end_src
+*** Configure Kubernetes Scheduler
+#+begin_src sh
+  mv kube-scheduler.kubeconfig /var/lib/kubernetes/
+  mv kube-scheduler.yaml /etc/kubernetes/config/
+  mv kube-scheduler.service /etc/systemd/system/
+#+end_src
+*** Start controller services
+Start systemd services
+#+begin_src sh
+  systemctl daemon-reload
+
+  systemctl enable kube-apiserver \
+            kube-controller-manager kube-scheduler
+
+  systemctl start kube-apiserver \
+            kube-controller-manager kube-scheduler
+#+end_src
+Verification 0: systemd service (server node)
+#+begin_src sh
+  systemctl is-active kube-apiserver
+  systemctl is-active kube-controller-manager
+  systemctl is-active kube-scheduler
+#+end_src
+Verification 1: Cluster info dumping (server node)
+#+begin_src sh
+  kubectl cluster-info \
+          --kubeconfig admin.kubeconfig
+#+end_src
+** RBAC for kubelet authorization
+This is operation on server node
+#+begin_src sh
+  ssh root@server
+#+end_src
+Apply using kubectl and ~admin.kubeconfig~ authentication file
+#+begin_src sh
+  kubectl apply -f kube-apiserver-to-kubelet.yaml \
+          --kubeconfig admin.kubeconfig
+#+end_src
+** Verification from the operation machine
+#+begin_src sh
+  curl --cacert secrets/certs/ca.crt \
+       https://server.kubernetes.local:6443/version
+  # output
+  {
+      "major": "1",
+      "minor": "33",
+      "emulationMajor": "1",
+      "emulationMinor": "33",
+      "minCompatibilityMajor": "1",
+      "minCompatibilityMinor": "32",
+      "gitVersion": "v1.33.0",
+      "gitCommit": "60a317eadfcb839692a68eab88b2096f4d708f4f",
+      "gitTreeState": "clean",
+      "buildDate": "2025-04-23T13:00:14Z",
+      "goVersion": "go1.24.2",
+      "compiler": "gc",
+      "platform": "linux/arm64"
+  }
+#+end_src
+* Bootstrap Worker Nodes
+
+** Prerequisites
+Copy files
+#+begin_src sh
+  for HOST in node-0 node-1; do
+      scp -i secrets/sshkey configs/kubelet-config.yaml root@${HOST}:~/
+  done
+#+end_src
+#+begin_src sh
+  ARCH="arm64"
+  for HOST in node-0 node-1; do
+      scp -i secrets/sshkey \
+          downloads/${ARCH}/worker/* \
+          downloads/${ARCH}/client/kubectl \
+          configs/99-loopback.conf \
+          configs/containerd-config.toml \
+          units/containerd.service \
+          units/kubelet.service \
+          root@${HOST}:~/
+  done
+#+end_src
+#+begin_src sh
+  ARCH="arm64"
+  for HOST in node-0 node-1; do
+      scp -i secrets/sshkey \
+          downloads/${ARCH}/cni-plugins/* \
+          root@${HOST}:~/cni-plugins/
+  done
+#+end_src
+** Setup on each node
+Jump
+#+begin_src sh
+  HOST="node-0"
+  ssh -i secrets/sshkey root@$HOST
+#+end_src
+Install modules
+#+begin_src sh
+  apt-get update
+  apt-get -y install socat conntrack ipset kmod
+#+end_src
+Disable swap for good (hard to allocate memory when swap is involved). Reference: https://serverfault.com/questions/1093773/how-to-permanently-remove-dev-zram0-as-swap-in-armbian
+#+begin_src sh
+  sed -i 's/# SWAP=false/SWAP=false/g' /etc/default/armbian-zram-config
+  reboot
+  # verification
+  swapon --show
+#+end_src
+Installation directories
+#+begin_src sh
+  mkdir -p \
+        /etc/cni/net.d \
+        /opt/cni/bin \
+        /var/lib/kubelet \
+        /var/lib/kubernetes \
+        /var/run/kubernetes
+#+end_src
+Worker binaries
+#+begin_src sh
+  mv crictl kubelet runc \
+     /usr/local/bin/
+  mv containerd containerd-shim-runc-v2 containerd-stress /bin/
+  mv cni-plugins/* /opt/cni/bin/
+#+end_src
+** Configure CNI networking
+Copy configuration files
+#+begin_src sh
+  mv 99-loopback.conf /etc/cni/net.d/
+#+end_src
+Load and configure ~br-netfilter~ kernel module
+#+begin_src sh
+  modprobe br-netfilter
+  echo "br-netfilter" >> /etc/modules-load.d/modules.conf
+
+  echo "net.bridge.bridge-nf-call-iptables = 1" \
+       >> /etc/sysctl.d/kubernetes.conf
+  echo "net.bridge.bridge-nf-call-ip6tables = 1" \
+       >> /etc/sysctl.d/kubernetes.conf
+  sysctl -p /etc/sysctl.d/kubernetes.conf
+#+end_src
+** Configure ~containerd~
+#+begin_src sh
+  mkdir -p /etc/containerd/
+  mv containerd-config.toml /etc/containerd/config.toml
+  mv containerd.service /etc/systemd/system/
+#+end_src
+** Configure ~kubelet~
+#+begin_src sh
+  mv kubelet-config.yaml /var/lib/kubelet/kubelet-config.yaml
+  mv kubelet.service /etc/systemd/system/
+#+end_src
+** Start services
+#+begin_src sh
+  systemctl daemon-reload
+  systemctl enable containerd kubelet
+  systemctl start containerd kubelet
+#+end_src
