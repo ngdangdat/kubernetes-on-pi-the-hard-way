@@ -594,3 +594,88 @@ Load and configure ~br-netfilter~ kernel module
   systemctl enable containerd kubelet
   systemctl start containerd kubelet
 #+end_src
+Setup for jumpbox's remote control (to install Cillium)
+#+begin_src sh
+  kubectl config set-cluster homelab \
+          --certificate-authority=secrets/certs/ca.crt \
+          --embed-certs=true \
+          --server=https://server.kubernetes.local:6443
+
+  kubectl config set-credentials admin \
+          --client-certificate=secrets/certs/admin.crt \
+          --client-key=secrets/certs/admin.key
+
+  kubectl config set-context homelab \
+          --cluster=homelab \
+          --user=admin
+
+  kubectl config use-context homelab
+#+end_src
+* Setup Cillium to fully replace kube-proxy
+Reference: [[https://docs.cilium.io/en/stable/network/kubernetes/kubeproxy-free/][Kubernetes without kube-proxy]]
+
+#+begin_src sh
+  API_SERVER_IP=server.kubernetes.local
+  API_SERVER_PORT=6443
+  helm install cilium cilium/cilium --version 1.17.3 \
+       --namespace kube-system \
+       --set kubeProxyReplacement=true \
+       --set k8sServiceHost=${API_SERVER_IP} \
+       --set k8sServicePort=${API_SERVER_PORT}
+#+end_src
+Check IP ranges for each node
+#+begin_src sh
+  kubectl get ciliumnode -o jsonpath='{range .items[*]}{.metadata.name} {.spec.ipam.podCIDRs[]}{"\n"}{end}' | column -t
+  # output
+  node-0  10.0.0.0/24
+  node-1  10.0.1.0/24
+#+end_src
+* Smoke test
+Encryption secret
+#+begin_src sh
+  kubectl create secret generic kubernetes-the-hard-way \
+          --from-literal="mykey=mydata"
+
+  ssh -i secrets/sshkey root@server \
+      'etcdctl get /registry/secrets/default/kubernetes-the-hard-way | hexdump -C'
+#+end_src
+Deployment
+#+begin_src sh
+  # create deployment
+  kubectl create deployment nginx --image=nginx:latest
+  # get pod
+  kubectl get pods -l app=nginx
+  
+#+end_src
+Forwarding port
+#+begin_src sh
+  POD_NAME=$(kubectl get pods -l app=nginx \
+                     -o jsonpath="{.items[0].metadata.name}")
+  kubectl port-forward $POD_NAME 8080:80
+  curl --head http://127.0.0.1:8080
+  kubectl logs $POD_NAME
+  kubectl exec -ti $POD_NAME -- nginx -v
+#+end_src
+Service
+#+begin_src sh
+  kubectl expose deployment nginx \
+          --port 80 --type NodePort
+  # get port
+  NODE_PORT=$(kubectl get svc nginx \
+                      --output=jsonpath='{range .spec.ports[0]}{.nodePort}')
+  NODE_NAME=$(kubectl get pods \
+                      -l app=nginx \
+                      -o jsonpath="{.items[0].spec.nodeName}")
+  # make call to the service
+  curl -I http://${NODE_NAME}:${NODE_PORT}
+
+  HTTP/1.1 200 OK
+  Server: nginx/1.27.5
+  Date: Sun, 04 May 2025 14:11:36 GMT
+  Content-Type: text/html
+  Content-Length: 615
+  Last-Modified: Wed, 16 Apr 2025 12:01:11 GMT
+  Connection: keep-alive
+  ETag: "67ff9c07-267"
+  Accept-Ranges: bytes
+#+end_src
