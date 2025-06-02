@@ -137,28 +137,29 @@ Check ~ca.conf~ file and adjust for your setup (remove kube-proxy section)
 #+end_src
 Create components certificates and private keys
 #+begin_src sh
-  certs=(
-      "admin" "node-0" "node-1"
-      "kube-scheduler"
-      "kube-controller-manager"
-      "kube-api-server"
-      "service-accounts"
-  )
-  CERTDIR=secrets/certs
-  for i in ${certs[*]}; do
-      openssl genrsa -out "${CERTDIR}/${i}.key" 4096
+certs=(
+    "admin" "node-0" "node-1"
+    "kube-scheduler"
+    "kube-controller-manager"
+    "kube-api-server"
+    "service-accounts"
+)
+certs=("server")
+CERTDIR=secrets/certs
+for i in ${certs[*]}; do
+    openssl genrsa -out "${CERTDIR}/${i}.key" 4096
 
-      openssl req -new -key "${CERTDIR}/${i}.key" -sha256 \
-              -config "${CERTDIR}/ca.conf" -section ${i} \
-              -out "${CERTDIR}/${i}.csr"
+    openssl req -new -key "${CERTDIR}/${i}.key" -sha256 \
+            -config "${CERTDIR}/ca.conf" -section ${i} \
+            -out "${CERTDIR}/${i}.csr"
 
-      openssl x509 -req -days 3653 -in "${CERTDIR}/${i}.csr" \
-              -copy_extensions copyall \
-              -sha256 -CA "${CERTDIR}/ca.crt" \
-              -CAkey "${CERTDIR}/ca.key" \
-              -CAcreateserial \
-              -out "${CERTDIR}/${i}.crt"
-  done
+    openssl x509 -req -days 3653 -in "${CERTDIR}/${i}.csr" \
+            -copy_extensions copyall \
+            -sha256 -CA "${CERTDIR}/ca.crt" \
+            -CAkey "${CERTDIR}/ca.key" \
+            -CAcreateserial \
+            -out "${CERTDIR}/${i}.crt"
+done
 #+end_src
 Check
 #+begin_src sh
@@ -207,11 +208,12 @@ Worker nodes
 #+end_src
 Server node
 #+begin_src sh
-  scp -i secrets/sshkey \
-      secrets/certs/ca.key secrets/certs/ca.crt \
-      secrets/certs/kube-api-server.key secrets/certs/kube-api-server.crt \
-      secrets/certs/service-accounts.key secrets/certs/service-accounts.crt \
-      root@server:~/
+scp -i secrets/sshkey \
+    secrets/certs/ca.key secrets/certs/ca.crt \
+    secrets/certs/kube-api-server.key secrets/certs/kube-api-server.crt \
+    secrets/certs/service-accounts.key secrets/certs/service-accounts.crt \
+    secrets/certs/server.key secrets/certs/server.crt \
+    root@server:~/
 #+end_src
 * Generate ~kubeconfig~ file for authentication
 #+begin_src sh
@@ -223,7 +225,8 @@ Server node
 #+begin_src sh
   CERTDIR="secrets/certs"
   AUTHDIR="secrets/kubernetes-auth"
-  for host in node-0 node-1; do
+  # for host in node-0 node-1; do
+  for host in server; do
       kubectl config set-cluster homelab \
               --certificate-authority=${CERTDIR}/ca.crt \
               --embed-certs=true \
@@ -318,11 +321,12 @@ Server node
             --kubeconfig=${AUTHDIR}/admin.kubeconfig
 #+end_src
 ** Distribute authentication config files
-worker nodes
+Worker nodes
 #+begin_src sh
   CERTDIR="secrets/certs"
   AUTHDIR="secrets/kubernetes-auth"
-  for host in node-0 node-1; do
+  # for host in node-0 node-1; do
+  for host in server; do
       ssh -i secrets/sshkey root@${host} "mkdir -p /var/lib/kubelet"
       scp -i secrets/sshkey ${AUTHDIR}/${host}.kubeconfig \
           root@${host}:/var/lib/kubelet/kubeconfig
@@ -330,12 +334,18 @@ worker nodes
 #+end_src
 server node
 #+begin_src sh
-  CERTDIR="secrets/certs"
-  AUTHDIR="secrets/kubernetes-auth"
-  scp -i secrets/sshkey ${AUTHDIR}/admin.kubeconfig \
-        ${AUTHDIR}/kube-controller-manager.kubeconfig \
-        ${AUTHDIR}/kube-scheduler.kubeconfig \
-        root@server:~/
+CERTDIR="secrets/certs"
+AUTHDIR="secrets/kubernetes-auth"
+# for host in node-0 node-1; do
+for host in server; do
+    ssh -i secrets/sshkey root@${host} "mkdir -p /var/lib/kubelet"
+    scp -i secrets/sshkey ${AUTHDIR}/${host}.kubeconfig \
+        root@${host}:/var/lib/kubelet/kubeconfig
+done
+scp -i secrets/sshkey ${AUTHDIR}/admin.kubeconfig \
+    ${AUTHDIR}/kube-controller-manager.kubeconfig \
+    ${AUTHDIR}/kube-scheduler.kubeconfig \
+    root@server:~/
 #+end_src
 * Generating the Data Encryption Config and Key
 Generate random key
@@ -519,9 +529,11 @@ Copy files
           root@${HOST}:~/
   done
 #+end_src
+Copy binaries
 #+begin_src sh
   ARCH="arm64"
   for HOST in node-0 node-1; do
+  for HOST in server; do
       scp -i secrets/sshkey \
           downloads/${ARCH}/cni-plugins/* \
           root@${HOST}:~/cni-plugins/
@@ -615,13 +627,22 @@ Setup for jumpbox's remote control (to install Cillium)
 Reference: [[https://docs.cilium.io/en/stable/network/kubernetes/kubeproxy-free/][Kubernetes without kube-proxy]]
 
 #+begin_src sh
-  API_SERVER_IP=server.kubernetes.local
-  API_SERVER_PORT=6443
-  helm install cilium cilium/cilium --version 1.17.3 \
-       --namespace kube-system \
-       --set kubeProxyReplacement=true \
-       --set k8sServiceHost=${API_SERVER_IP} \
-       --set k8sServicePort=${API_SERVER_PORT}
+API_SERVER_IP=server.kubernetes.local
+API_SERVER_PORT=6443
+helm install cilium cilium/cilium \
+     --namespace kube-system \
+     --set kubeProxyReplacement=strict \
+     --set k8sServiceHost=${API_SERVER_IP} \
+     --set k8sServicePort=${API_SERVER_PORT} \
+     --set l7Proxy=true \
+     --set dnsProxy.enableTransparentMode=false \
+     --set dnsProxy.enableDnsCompression=false \
+     --set k8sNetworkPolicy.enabled=false \
+     --set bgpControlPlane.enabled=true
+
+helm upgrade cilium -n kube-system --set kubeProxyReplacement=strict
+curl -L --fail --remote-name-all "https://github.com/cilium/cilium-cli/releases/download/${CILIUM_CLI_VERSION}/cilium-linux-${CLI_ARCH}.tar.gz{,.sha256sum}"
+
 #+end_src
 Check IP ranges for each node
 #+begin_src sh
@@ -629,6 +650,28 @@ Check IP ranges for each node
   # output
   node-0  10.0.0.0/24
   node-1  10.0.1.0/24
+#+end_src
+* Setup DNS for the cluster
+#+begin_src sh
+helm repo add coredns https://coredns.github.io/helm
+helm --namespace=kube-system install coredns coredns/coredns
+#+end_src
+* Setup cloudflare tunnel
+cert-manager (prerequisites)
+#+begin_src sh
+helm install cert-manager jetstack/cert-manager \
+     --namespace cert-manager \
+     --create-namespace \
+     --set crds.enabled=true \
+     --set startupapicheck.enabled=false
+#+end_src
+Problem: https verification error
+#+begin_src sh
+kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.17.2/cert-manager.yaml
+#+end_src
+API token: ~_5cp9Kbeo_Gh-eP7InGO0R-HhXUmsKNtPdn692yp~
+#+begin_src sh
+
 #+end_src
 * Smoke test
 Encryption secret
