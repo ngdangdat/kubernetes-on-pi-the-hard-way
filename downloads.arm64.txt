@@ -1,0 +1,7 @@
+https://github.com/containerd/containerd/releases/download/v2.1.1/containerd-2.1.1-linux-arm64.tar.gz
+https://storage.googleapis.com/cri-o/artifacts/cri-o.arm64.v1.33.0.tar.gz
+https://github.com/opencontainers/runc/releases/download/v1.3.0/runc.arm64
+https://github.com/containernetworking/plugins/releases/download/v1.7.1/cni-plugins-linux-arm-v1.7.1.tgz
+https://dl.k8s.io/release/v1.33.0/bin/linux/arm64/kubectl
+https://dl.k8s.io/v1.33.0/bin/linux/arm64/kubelet
+https://dl.k8s.io/v1.33.0/bin/linux/arm64/kubeadm

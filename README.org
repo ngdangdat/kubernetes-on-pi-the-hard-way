@@ -1,0 +1,123 @@
+#+title: Kubernetes on Pi using kubeadm
+
+* 00. Setup machines and operation machines
+Hostname information, machines.txt
+#+begin_src txt
+192.168.68.106 server.kubernetes.local server
+192.168.68.111 node-0.kubernetes.local node-0
+192.168.68.112 node-1.kubernetes.local node-1
+#+end_src
+Distribute hostname config
+#+begin_src sh
+while read IP FQDN HOST; do
+    CMD="sed -i 's/^127.0.1.1.*/127.0.1.1\t${FQDN} ${HOST}/' /etc/hosts"
+    ssh -i secrets/sshkey -n root@${IP} "$CMD"
+    ssh -i secrets/sshkey -n root@${IP} hostnamectl set-hostname ${HOST}
+    ssh -i secrets/sshkey -n root@${IP} systemctl restart systemd-hostnamed
+done < machines.txt
+
+while read IP FQDN HOST; do
+    ssh -i secrets/sshkey -n root@${IP} hostname --fqdn
+done < machines.txt
+
+# Operation machine
+while read IP FQDN HOST SUBNET; do
+    ENTRY="${IP} ${FQDN} ${HOST}"
+    echo $ENTRY >> hosts
+done < machines.txt
+cat hosts >> /etc/hosts
+
+while read IP FQDN HOST SUBNET; do
+    scp -i secrets/sshkey hosts root@${HOST}:~/
+    ssh -i secrets/sshkey -n \
+        root@${HOST} "cat hosts >> /etc/hosts && rm hosts"
+done < machines.txt
+#+end_src
+* 01. Prepare binaries
+Container runtime
+arm64 (not necessary for amd64)
+#+begin_src txt
+https://github.com/containerd/containerd/releases/download/v2.1.1/containerd-2.1.1-linux-arm64.tar.gz
+https://github.com/opencontainers/runc/releases/download/v1.3.0/runc.arm64
+https://github.com/containernetworking/plugins/releases/download/v1.7.1/cni-plugins-linux-arm-v1.7.1.tgz
+
+#+end_src
+
+Download binaries
+#+begin_src sh
+ARCH=arm64
+BASEDIR=downloads
+DLDIR=${BASEDIR}/${ARCH}
+mkdir -p ${DLDIR}
+
+wget -q --show-progress --https-only --timestamping \
+     -i downloads.${ARCH}.txt \
+     -P ${DLDIR}
+#+end_src
+Extract
+#+begin_src sh
+ARCH=arm64
+DLDIR=downloads/${ARCH}
+OUTPUTDIR=${DLDIR}/binaries
+mkdir -p ${OUTPUTDIR}/cni-plugins
+tar -xvf ${DLDIR}/containerd-2.1.1-linux-${ARCH}.tar.gz \
+    --strip-components 1 \
+    -C ${OUTPUTDIR}
+tar -xvf ${DLDIR}/cni-plugins-linux-arm-v1.7.1.tgz \
+    --strip-components 1 \
+    -C ${OUTPUTDIR}/cni-plugins
+
+mv ${DLDIR}/runc.${ARCH} ${OUTPUTDIR}/runc
+chmod +x ${OUTPUTDIR}/runc
+#+end_src
+* 02. Install containerd
+Copy files
+#+begin_src sh
+ARCH="arm64"
+while read IP FQDN HOST; do
+    # runc
+    scp -i secrets/sshkey \
+        downloads/${ARCH}/binaries/runc \
+        root@${HOST}:/usr/local/bin
+
+    scp -i secrets/sshkey \
+        downloads/${ARCH}/binaries/{containerd,containerd-shim-runc-v2,containerd-stress} \
+        root@${HOST}:/bin
+    
+    # CNI plugins
+    ssh -i secrets/sshkey -n root@${HOST} mkdir -p /opt/cni/bin/
+    scp -i secrets/sshkey \
+        downloads/${ARCH}/binaries/cni-plugins/* \
+        root@${HOST}:/opt/cni/bin
+
+    # containerd configuration file
+    ssh -i secrets/sshkey -n root@${HOST} mkdir -p /etc/containerd
+    scp -i secrets/sshkey \
+        ./configs/containerd-config.toml \
+        root@${HOST}:/etc/containerd/config.toml
+    
+    # containerd.service unit file
+    scp -i secrets/sshkey \
+        ./units/containerd.service \
+        root@${HOST}:/etc/systemd/system
+done < machines.txt
+#+end_src
+Enable and start service
+#+begin_src sh
+ARCH="arm64"
+while read IP FQDN HOST; do
+    ssh -i secrets/sshkey -n root@${HOST} "systemctl daemon-reload && systemctl enable --now containerd"
+done < machines.txt
+#+end_src
+kubelet and kubectl
+#+begin_src sh
+ARCH="arm64"
+chmod +x downloads/${ARCH}/{kubelet,kubectl,kubeadm}
+while read IP FQDN HOST; do
+    scp -i secrets/sshkey downloads/${ARCH}/{kubelet,kubectl,kubeadm} root@${HOST}:/usr/local/bin
+    scp -i secrets/sshkey units/kubelet.service root@${HOST}:/etc/systemd/system/
+    ssh -i secrets/sshkey -n root@${HOST} "systemctl daemon-reload && systemctl enable --now kubelet"
+done < machines.txt
+#+end_src
+* References
+- https://kubernetes.io/docs/reference/setup-tools/kubeadm/kubeadm-init/
