@@ -1,11 +1,12 @@
+
 #+title: Kubernetes on Pi using kubeadm
 
 * 00. Setup machines and operation machines
 Hostname information, machines.txt
 #+begin_src txt
-192.168.68.106 server.kubernetes.local server
-192.168.68.111 node-0.kubernetes.local node-0
-192.168.68.112 node-1.kubernetes.local node-1
+192.168.68.106 server.kubernetes.local server 10.244.0.0/24
+192.168.68.111 node-0.kubernetes.local node-0 10.244.1.0/24
+192.168.68.112 node-1.kubernetes.local node-1 10.244.2.0/24
 #+end_src
 Distribute hostname config
 #+begin_src sh
@@ -34,15 +35,6 @@ while read IP FQDN HOST SUBNET; do
 done < machines.txt
 #+end_src
 * 01. Prepare binaries
-Container runtime
-arm64 (not necessary for amd64)
-#+begin_src txt
-https://github.com/containerd/containerd/releases/download/v2.1.1/containerd-2.1.1-linux-arm64.tar.gz
-https://github.com/opencontainers/runc/releases/download/v1.3.0/runc.arm64
-https://github.com/containernetworking/plugins/releases/download/v1.7.1/cni-plugins-linux-arm-v1.7.1.tgz
-
-#+end_src
-
 Download binaries
 #+begin_src sh
 ARCH=arm64
@@ -66,6 +58,8 @@ tar -xvf ${DLDIR}/containerd-2.1.1-linux-${ARCH}.tar.gz \
 tar -xvf ${DLDIR}/cni-plugins-linux-arm-v1.7.1.tgz \
     --strip-components 1 \
     -C ${OUTPUTDIR}/cni-plugins
+tar -xvf ${DLDIR}/crictl-v1.33.0-linux-${ARCH}.tar.gz \
+    -C ${OUTPUTDIR}
 
 mv ${DLDIR}/runc.${ARCH} ${OUTPUTDIR}/runc
 chmod +x ${OUTPUTDIR}/runc
@@ -74,10 +68,10 @@ chmod +x ${OUTPUTDIR}/runc
 Copy files
 #+begin_src sh
 ARCH="arm64"
-while read IP FQDN HOST; do
+while read IP FQDN HOST SUBNET; do
     # runc
     scp -i secrets/sshkey \
-        downloads/${ARCH}/binaries/runc \
+        downloads/${ARCH}/binaries/{runc,crictl} \
         root@${HOST}:/usr/local/bin
 
     scp -i secrets/sshkey \
@@ -90,6 +84,11 @@ while read IP FQDN HOST; do
         downloads/${ARCH}/binaries/cni-plugins/* \
         root@${HOST}:/opt/cni/bin
 
+    sed "s#SUBNET#${SUBNET}#g" configs/10-bridge.conf.template > configs/10-bridge.conf.${HOST}
+    ssh -i secrets/sshkey -n root@${HOST} mkdir -p /etc/cni/net.d/
+    scp -i secrets/sshkey ./configs/99-loopback.conf root@${HOST}:/etc/cni/net.d/
+    scp -i secrets/sshkey ./configs/10-bridge.conf.${HOST} root@${HOST}:/etc/cni/net.d/10-bridge.conf
+    
     # containerd configuration file
     ssh -i secrets/sshkey -n root@${HOST} mkdir -p /etc/containerd
     scp -i secrets/sshkey \
@@ -104,20 +103,121 @@ done < machines.txt
 #+end_src
 Enable and start service
 #+begin_src sh
-ARCH="arm64"
-while read IP FQDN HOST; do
+while read IP FQDN HOST SUBNET; do
     ssh -i secrets/sshkey -n root@${HOST} "systemctl daemon-reload && systemctl enable --now containerd"
+    ssh -i secrets/sshkey -n root@${HOST} "systemctl restart containerd"
 done < machines.txt
 #+end_src
 kubelet and kubectl
 #+begin_src sh
-ARCH="arm64"
 chmod +x downloads/${ARCH}/{kubelet,kubectl,kubeadm}
-while read IP FQDN HOST; do
-    scp -i secrets/sshkey downloads/${ARCH}/{kubelet,kubectl,kubeadm} root@${HOST}:/usr/local/bin
-    scp -i secrets/sshkey units/kubelet.service root@${HOST}:/etc/systemd/system/
-    ssh -i secrets/sshkey -n root@${HOST} "systemctl daemon-reload && systemctl enable --now kubelet"
+# copy kubelet service for server
+for HOST in server; do
+    scp -i secrets/sshkey units/kubelet.server.service root@${HOST}:/etc/systemd/system/
 done < machines.txt
+
+# copy kubelet service for worker
+for HOST in node-0 node-1; do
+    scp -i secrets/sshkey units/kubelet.client.service root@${HOST}:/etc/systemd/system/
+    ssh -i secrets/sshkey -n root@${HOST} mkdir -p /etc/kubernetes/manifests
+done < machines.txt
+
+while read IP FQDN HOST SUBNET; do
+    scp -i secrets/sshkey downloads/${ARCH}/{kubelet,kubectl,kubeadm} root@${HOST}:/usr/local/bin
+    ssh -i secrets/sshkey -n root@${HOST} "systemctl daemon-reload && systemctl enable kubelet"
+done < machines.txt
+#+end_src
+* 03. Setup using kubeadm
+Intialize the cluster
+#+begin_src sh
+ssh -i secrets/sshkey root@server
+
+SERVER_IP=192.168.68.106
+SERVER_HOSTNAME=server.kubernetes.local
+POD_CIDR=10.244.0.0/16
+kubeadm init \
+        --apiserver-advertise-address=${SERVER_IP} \
+        --control-plane-endpoint=${SERVER_HOSTNAME} \
+        --pod-network-cidr=${POD_CIDR}
+# output
+kubeadm join server.kubernetes.local:6443 --token <token> \
+        --discovery-token-ca-cert-hash sha256:<discovery-token>
+#+end_src
+
+* 04. Setup account on machine
+Get token
+#+begin_src sh
+# Create service account
+kubectl create serviceaccount remote-user
+
+# Create cluster role binding (adjust permissions as needed)
+kubectl create clusterrolebinding remote-user-binding \
+  --clusterrole=cluster-admin \
+  --serviceaccount=default:remote-user
+
+# Get the token (K8s 1.24+)
+kubectl create token remote-user
+
+# Or for older versions
+kubectl get secret $(kubectl get serviceaccount remote-user -o jsonpath='{.secrets[0].name}') -o jsonpath='{.data.token}' | base64 -d
+#+end_src
+
+Get CA base64
+#+begin_src sh
+# on server
+cat /etc/kubernetes/pki/ca.crt
+
+cat <<EOF > ./secrets/ca.crt
+<data>
+EOF
+# on jumpbox
+kubectl config set-cluster homelab \
+          --certificate-authority=secrets/ca.crt \
+          --embed-certs=true \
+          --server=https://server.kubernetes.local:6443
+kubectl config set-credentials remote-user \
+  --client-certificate=./secrets/client.crt \
+  --client-key=./secrets/client.key \
+  --embed-certs=true
+
+kubectl config set-context homelab \
+  --cluster=homelab \
+  --user=remote-user
+#+end_src
+* 05. Setup routing (pod to pod communication)
+#+begin_src sh
+SERVER_IP=$(grep server machines.txt | cut -d " " -f 1)
+SERVER_SUBNET=$(grep server machines.txt | cut -d " " -f 4)
+NODE_0_IP=$(grep node-0 machines.txt | cut -d " " -f 1)
+NODE_0_SUBNET=$(grep node-0 machines.txt | cut -d " " -f 4)
+NODE_1_IP=$(grep node-1 machines.txt | cut -d " " -f 1)
+NODE_1_SUBNET=$(grep node-1 machines.txt | cut -d " " -f 4)
+#+end_src
+Add routes
+#+begin_src sh
+# server
+ssh -i secrets/sshkey root@server <<EOF
+  ip route add ${NODE_0_SUBNET} via ${NODE_0_IP}
+  ip route add ${NODE_1_SUBNET} via ${NODE_1_IP}
+EOF
+
+# node-0
+ssh -i secrets/sshkey root@node-0 <<EOF
+  ip route add ${SERVER_SUBNET} via ${SERVER_IP}
+  ip route add ${NODE_1_SUBNET} via ${NODE_1_IP}
+EOF
+# node-1
+ssh -i secrets/sshkey root@node-1 <<EOF
+  ip route add ${SERVER_SUBNET} via ${SERVER_IP}
+  ip route add ${NODE_0_SUBNET} via ${NODE_0_IP}
+EOF
+#+end_src
+* 0x. Clean up
+#+begin_src sh
+kubeadm reset -f
+sudo rm -rf /etc/kubernetes/
+sudo rm -rf /var/lib/kubelet/
+sudo rm -rf ~/.kube/
 #+end_src
 * References
 - https://kubernetes.io/docs/reference/setup-tools/kubeadm/kubeadm-init/
