@@ -10,14 +10,14 @@ Hostname information, machines.txt
 #+end_src
 Distribute hostname config
 #+begin_src sh
-while read IP FQDN HOST; do
+while read IP FQDN HOST SUBNET; do
     CMD="sed -i 's/^127.0.1.1.*/127.0.1.1\t${FQDN} ${HOST}/' /etc/hosts"
     ssh -i secrets/sshkey -n root@${IP} "$CMD"
     ssh -i secrets/sshkey -n root@${IP} hostnamectl set-hostname ${HOST}
     ssh -i secrets/sshkey -n root@${IP} systemctl restart systemd-hostnamed
 done < machines.txt
 
-while read IP FQDN HOST; do
+while read IP FQDN HOST SUBNET; do
     ssh -i secrets/sshkey -n root@${IP} hostname --fqdn
 done < machines.txt
 
@@ -26,7 +26,6 @@ while read IP FQDN HOST SUBNET; do
     ENTRY="${IP} ${FQDN} ${HOST}"
     echo $ENTRY >> hosts
 done < machines.txt
-cat hosts >> /etc/hosts
 
 while read IP FQDN HOST SUBNET; do
     scp -i secrets/sshkey hosts root@${HOST}:~/
@@ -84,10 +83,7 @@ while read IP FQDN HOST SUBNET; do
         downloads/${ARCH}/binaries/cni-plugins/* \
         root@${HOST}:/opt/cni/bin
 
-    sed "s#SUBNET#${SUBNET}#g" configs/10-bridge.conf.template > configs/10-bridge.conf.${HOST}
     ssh -i secrets/sshkey -n root@${HOST} mkdir -p /etc/cni/net.d/
-    scp -i secrets/sshkey ./configs/99-loopback.conf root@${HOST}:/etc/cni/net.d/
-    scp -i secrets/sshkey ./configs/10-bridge.conf.${HOST} root@${HOST}:/etc/cni/net.d/10-bridge.conf
     
     # containerd configuration file
     ssh -i secrets/sshkey -n root@${HOST} mkdir -p /etc/containerd
@@ -113,12 +109,12 @@ kubelet and kubectl
 chmod +x downloads/${ARCH}/{kubelet,kubectl,kubeadm}
 # copy kubelet service for server
 for HOST in server; do
-    scp -i secrets/sshkey units/kubelet.server.service root@${HOST}:/etc/systemd/system/
+    scp -i secrets/sshkey units/kubelet.server.service root@${HOST}:/etc/systemd/system/kubelet.service
 done < machines.txt
 
 # copy kubelet service for worker
 for HOST in node-0 node-1; do
-    scp -i secrets/sshkey units/kubelet.client.service root@${HOST}:/etc/systemd/system/
+    scp -i secrets/sshkey units/kubelet.client.service root@${HOST}:/etc/systemd/system/kubelet.service
     ssh -i secrets/sshkey -n root@${HOST} mkdir -p /etc/kubernetes/manifests
 done < machines.txt
 
@@ -128,6 +124,18 @@ while read IP FQDN HOST SUBNET; do
 done < machines.txt
 #+end_src
 * 03. Setup using kubeadm
+TODO: Turn off swap
+#+begin_src sh
+sudo modprobe overlay
+sudo modprobe br_netfilter
+while read IP FQDN HOST SUBNET; do
+    scp -i secrets/sshkey configs/k8s.conf root@${HOST}:/etc/sysctl.d/
+    ssh -i secrets/sshkey -n root@${HOST} "modprobe overlay"
+    ssh -i secrets/sshkey -n root@${HOST} "modprobe br_netfilter"
+    ssh -i secrets/sshkey -n root@${HOST} "sysctl --system"
+done < machines.txt
+#+end_src
+
 Intialize the cluster
 #+begin_src sh
 ssh -i secrets/sshkey root@server
@@ -135,16 +143,25 @@ ssh -i secrets/sshkey root@server
 SERVER_IP=192.168.68.106
 SERVER_HOSTNAME=server.kubernetes.local
 POD_CIDR=10.244.0.0/16
+EXTRA_SERVER_SANS=server,192.168.68.106,k8s-homelab.ngdangdat.info
 kubeadm init \
         --apiserver-advertise-address=${SERVER_IP} \
         --control-plane-endpoint=${SERVER_HOSTNAME} \
-        --pod-network-cidr=${POD_CIDR}
+        --pod-network-cidr=${POD_CIDR} \
+        --apiserver-cert-extra-sans=${EXTRA_SERVER_SANS}
+
 # output
 kubeadm join server.kubernetes.local:6443 --token <token> \
         --discovery-token-ca-cert-hash sha256:<discovery-token>
 #+end_src
 
 * 04. Setup account on machine
+#+begin_src sh
+mkdir -p $HOME/.kube
+sudo cp -i /etc/kubernetes/admin.conf $HOME/.kube/config
+sudo chown $(id -u):$(id -g) $HOME/.kube/config
+#+end_src
+
 Get token
 #+begin_src sh
 # Create service account
@@ -153,13 +170,14 @@ kubectl create serviceaccount remote-user
 # Create cluster role binding (adjust permissions as needed)
 kubectl create clusterrolebinding remote-user-binding \
   --clusterrole=cluster-admin \
-  --serviceaccount=default:remote-user
+  --serviceaccount=remote-user
 
-# Get the token (K8s 1.24+)
-kubectl create token remote-user
+# Generate client certificate and key
+sudo kubeadm kubeconfig user --client-name=remote-user --config=/etc/kubernetes/admin.conf > remote-user.kubeconfig
 
-# Or for older versions
-kubectl get secret $(kubectl get serviceaccount remote-user -o jsonpath='{.secrets[0].name}') -o jsonpath='{.data.token}' | base64 -d
+# Extract the certificate and key from the kubeconfig
+kubectl config view --kubeconfig=remote-user.kubeconfig --flatten --raw -o jsonpath='{.users[0].user.client-certificate-data}' | base64 -d > client.crt
+kubectl config view --kubeconfig=remote-user.kubeconfig --flatten --raw -o jsonpath='{.users[0].user.client-key-data}' | base64 -d > client.key
 #+end_src
 
 Get CA base64
@@ -183,34 +201,24 @@ kubectl config set-credentials remote-user \
 kubectl config set-context homelab \
   --cluster=homelab \
   --user=remote-user
-#+end_src
-* 05. Setup routing (pod to pod communication)
-#+begin_src sh
-SERVER_IP=$(grep server machines.txt | cut -d " " -f 1)
-SERVER_SUBNET=$(grep server machines.txt | cut -d " " -f 4)
-NODE_0_IP=$(grep node-0 machines.txt | cut -d " " -f 1)
-NODE_0_SUBNET=$(grep node-0 machines.txt | cut -d " " -f 4)
-NODE_1_IP=$(grep node-1 machines.txt | cut -d " " -f 1)
-NODE_1_SUBNET=$(grep node-1 machines.txt | cut -d " " -f 4)
-#+end_src
-Add routes
-#+begin_src sh
-# server
-ssh -i secrets/sshkey root@server <<EOF
-  ip route add ${NODE_0_SUBNET} via ${NODE_0_IP}
-  ip route add ${NODE_1_SUBNET} via ${NODE_1_IP}
-EOF
 
-# node-0
-ssh -i secrets/sshkey root@node-0 <<EOF
-  ip route add ${SERVER_SUBNET} via ${SERVER_IP}
-  ip route add ${NODE_1_SUBNET} via ${NODE_1_IP}
-EOF
-# node-1
-ssh -i secrets/sshkey root@node-1 <<EOF
-  ip route add ${SERVER_SUBNET} via ${SERVER_IP}
-  ip route add ${NODE_0_SUBNET} via ${NODE_0_IP}
-EOF
+# check
+NS=kube-system
+kubectl get po -n $NS
+#+end_src
+
+* 05. Setup flannel for CNI network
+#+begin_src sh
+# Needs manual creation of namespace to avoid helm error
+kubectl create ns kube-flannel
+kubectl label --overwrite ns kube-flannel pod-security.kubernetes.io/enforce=privileged
+
+helm repo add flannel https://flannel-io.github.io/flannel/
+helm install flannel --set podCidr="10.244.0.0/16" --namespace kube-flannel flannel/flannel
+#+end_src
+* 06. Label worker nodes
+#+begin_src sh
+kubectl label nodes node-0.kubernetes.local node-1.kubernetes.local node-role.kubernetes.io/worker=
 #+end_src
 * 0x. Clean up
 #+begin_src sh
