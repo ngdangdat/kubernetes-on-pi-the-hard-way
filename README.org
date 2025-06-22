@@ -126,12 +126,11 @@ done < machines.txt
 * 03. Setup using kubeadm
 TODO: Turn off swap
 #+begin_src sh
-sudo modprobe overlay
-sudo modprobe br_netfilter
 while read IP FQDN HOST SUBNET; do
     scp -i secrets/sshkey configs/k8s.conf root@${HOST}:/etc/sysctl.d/
     ssh -i secrets/sshkey -n root@${HOST} "modprobe overlay"
     ssh -i secrets/sshkey -n root@${HOST} "modprobe br_netfilter"
+    ssh -i secrets/sshkey -n root@${HOST} "echo br_netfilter > /etc/modules-load.d/br_netfilter.conf && echo overlay > /etc/modules-load.d/overlay.conf"
     ssh -i secrets/sshkey -n root@${HOST} "sysctl --system"
 done < machines.txt
 #+end_src
