@@ -7,6 +7,7 @@ Hostname information, machines.txt
 192.168.68.106 server.kubernetes.local server 10.244.0.0/24
 192.168.68.111 node-0.kubernetes.local node-0 10.244.1.0/24
 192.168.68.112 node-1.kubernetes.local node-1 10.244.2.0/24
+192.168.68.107 node-2.kubernetes.local node-2 10.244.3.0/24
 #+end_src
 Distribute hostname config
 #+begin_src sh
@@ -110,13 +111,13 @@ chmod +x downloads/${ARCH}/{kubelet,kubectl,kubeadm}
 # copy kubelet service for server
 for HOST in server; do
     scp -i secrets/sshkey units/kubelet.server.service root@${HOST}:/etc/systemd/system/kubelet.service
-done < machines.txt
+done
 
 # copy kubelet service for worker
-for HOST in node-0 node-1; do
+for HOST in node-0 node-1 node-2; do
     scp -i secrets/sshkey units/kubelet.client.service root@${HOST}:/etc/systemd/system/kubelet.service
     ssh -i secrets/sshkey -n root@${HOST} mkdir -p /etc/kubernetes/manifests
-done < machines.txt
+done
 
 while read IP FQDN HOST SUBNET; do
     scp -i secrets/sshkey downloads/${ARCH}/{kubelet,kubectl,kubeadm} root@${HOST}:/usr/local/bin
@@ -153,7 +154,10 @@ kubeadm init \
 kubeadm join server.kubernetes.local:6443 --token <token> \
         --discovery-token-ca-cert-hash sha256:<discovery-token>
 #+end_src
-
+Re-generate join command
+#+begin_src sh
+kubeadm token create --print-join-command
+#+end_src
 * 04. Setup account on machine
 #+begin_src sh
 mkdir -p $HOME/.kube
